@@ -23,6 +23,7 @@ if _exports_dir.is_dir() and str(_exports_dir) not in sys.path:
 del _framework_dir, _project_root, _exports_dir
 
 from mcp.server import FastMCP  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from framework.graph import (  # noqa: E402
     Constraint,
@@ -585,7 +586,11 @@ def add_node(
         str, "JSON object mapping conditions to target node IDs for router nodes"
     ] = "{}",
     client_facing: Annotated[
-        bool, "If True, node streams output to user and blocks for input between turns"
+        bool,
+        "If True, an ask_user() tool is injected so the LLM can explicitly request user input. "
+        "The node blocks ONLY when ask_user() is called — text-only turns stream freely. "
+        "Set True for nodes that interact with users (intake, review, approval). "
+        "Nodes that do autonomous work (research, data processing, API calls) MUST be False.",
     ] = False,
     nullable_output_keys: Annotated[
         str, "JSON array of output keys that may remain unset (for mutually exclusive outputs)"
@@ -664,6 +669,14 @@ def add_node(
         warnings.append(
             f"Node type '{node_type}' is deprecated. Use 'event_loop' instead. "
             "EventLoopNode supports tool use, streaming, and judge-based evaluation."
+        )
+
+    # Warn about client_facing on nodes with tools (likely autonomous work)
+    if node_type == "event_loop" and client_facing and tools_list:
+        warnings.append(
+            f"Node '{node_id}' is client_facing=True but has tools {tools_list}. "
+            "Nodes with tools typically do autonomous work and should be "
+            "client_facing=False. Only set True if this node needs user approval."
         )
 
     # nullable_output_keys must be a subset of output_keys
@@ -1376,6 +1389,17 @@ def validate_graph() -> str:
             f"Node '{dn['node_id']}' uses deprecated type '{dn['type']}'. Use 'event_loop' instead."
         )
 
+    # Warn if all event_loop nodes are client_facing (common misconfiguration)
+    el_nodes = [n for n in session.nodes if n.node_type == "event_loop"]
+    cf_el_nodes = [n for n in el_nodes if n.client_facing]
+    if len(el_nodes) > 1 and len(cf_el_nodes) == len(el_nodes):
+        warnings.append(
+            f"ALL {len(el_nodes)} event_loop nodes are client_facing=True. "
+            "This injects ask_user() on every node. Only nodes that need user "
+            "interaction (intake, review, approval) should be client_facing. Set "
+            "client_facing=False on autonomous processing nodes."
+        )
+
     # Collect summary info
     event_loop_nodes = [n.id for n in session.nodes if n.node_type == "event_loop"]
     client_facing_nodes = [n.id for n in session.nodes if n.client_facing]
@@ -1834,6 +1858,85 @@ def export_graph() -> str:
 
 
 @mcp.tool()
+def import_from_export(
+    agent_json_path: Annotated[str, "Path to the agent.json file to import"],
+) -> str:
+    """
+    Import an agent definition from an exported agent.json file into the current build session.
+
+    Reads the agent.json, parses goal/nodes/edges, and populates the current session.
+    This is the reverse of export_graph().
+
+    Args:
+        agent_json_path: Path to the agent.json file to import
+
+    Returns:
+        JSON summary of what was imported (goal name, node count, edge count)
+    """
+    session = get_session()
+
+    path = Path(agent_json_path)
+    if not path.exists():
+        return json.dumps({"success": False, "error": f"File not found: {agent_json_path}"})
+
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+
+    try:
+        # Parse goal (same pattern as BuildSession.from_dict lines 88-99)
+        goal_data = data.get("goal")
+        if goal_data:
+            session.goal = Goal(
+                id=goal_data["id"],
+                name=goal_data["name"],
+                description=goal_data["description"],
+                success_criteria=[
+                    SuccessCriterion(**sc) for sc in goal_data.get("success_criteria", [])
+                ],
+                constraints=[Constraint(**c) for c in goal_data.get("constraints", [])],
+            )
+
+        # Parse nodes (same pattern as BuildSession.from_dict line 102)
+        graph_data = data.get("graph", {})
+        nodes_data = graph_data.get("nodes", [])
+        session.nodes = [NodeSpec(**n) for n in nodes_data]
+
+        # Parse edges (same pattern as BuildSession.from_dict lines 105-118)
+        edges_data = graph_data.get("edges", [])
+        session.edges = []
+        for e in edges_data:
+            condition_str = e.get("condition")
+            if isinstance(condition_str, str):
+                condition_map = {
+                    "always": EdgeCondition.ALWAYS,
+                    "on_success": EdgeCondition.ON_SUCCESS,
+                    "on_failure": EdgeCondition.ON_FAILURE,
+                    "conditional": EdgeCondition.CONDITIONAL,
+                    "llm_decide": EdgeCondition.LLM_DECIDE,
+                }
+                e["condition"] = condition_map.get(condition_str, EdgeCondition.ON_SUCCESS)
+            session.edges.append(EdgeSpec(**e))
+    except (KeyError, TypeError, ValueError, ValidationError) as e:
+        return json.dumps({"success": False, "error": f"Malformed agent.json: {e}"})
+
+    # Persist updated session
+    _save_session(session)
+
+    return json.dumps(
+        {
+            "success": True,
+            "goal": session.goal.name if session.goal else None,
+            "nodes_count": len(session.nodes),
+            "edges_count": len(session.edges),
+            "node_ids": [n.id for n in session.nodes],
+            "edge_ids": [e.id for e in session.edges],
+        }
+    )
+
+
+@mcp.tool()
 def get_session_status() -> str:
     """Get the current status of the build session."""
     session = get_session()
@@ -2213,7 +2316,7 @@ def test_node(
             )
         else:
             cf_note = (
-                "Node is client-facing: will block for user input between turns. "
+                "Node is client-facing: has ask_user() tool, blocks when LLM calls it. "
                 if node_spec.client_facing
                 else ""
             )
