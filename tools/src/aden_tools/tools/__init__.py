@@ -45,6 +45,7 @@ from .github_tool import register_tools as register_github
 from .hubspot_tool import register_tools as register_hubspot
 from .pdf_read_tool import register_tools as register_pdf_read
 from .runtime_logs_tool import register_tools as register_runtime_logs
+from .serpapi_tool import register_tools as register_serpapi
 from .slack_tool import register_tools as register_slack
 from .web_scrape_tool import register_tools as register_web_scrape
 from .web_search_tool import register_tools as register_web_search
@@ -81,6 +82,7 @@ def register_all_tools(
     register_apollo(mcp, credentials=credentials)
     # calendar tools require Google Calendar OAuth token
     register_calendar(mcp, credentials=credentials)
+    register_serpapi(mcp, credentials=credentials)
     register_slack(mcp, credentials=credentials)
 
     # Register file system toolkits
@@ -162,6 +164,12 @@ def register_all_tools(
         "query_runtime_logs",
         "query_runtime_log_details",
         "query_runtime_log_raw",
+        # SerpAPI tools (Google Scholar & Patents)
+        "scholar_search",
+        "scholar_get_citations",
+        "scholar_get_author",
+        "patents_search",
+        "patents_get_details",
         "slack_send_message",
         "slack_list_channels",
         "slack_get_channel_history",
