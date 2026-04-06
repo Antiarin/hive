@@ -1042,6 +1042,7 @@ class EventLoopNode(NodeProtocol):
                         node_id,
                         iteration,
                     )
+                    await self._fire_completion_hooks(conversation, ctx, node_id)
                     await self._publish_loop_completed(
                         stream_id, node_id, iteration + 1, execution_id
                     )
@@ -1173,6 +1174,7 @@ class EventLoopNode(NodeProtocol):
                         escalate_count=_escalate_count,
                         continue_count=_continue_count,
                     )
+                await self._fire_completion_hooks(conversation, ctx, node_id)
                 return NodeResult(
                     success=False,
                     error=(
@@ -1265,6 +1267,15 @@ class EventLoopNode(NodeProtocol):
                 recent_responses=recent_responses,
                 recent_tool_fingerprints=recent_tool_fingerprints,
                 pending_input=None,
+            )
+
+            # 6g2. Fire iteration_boundary hooks (DS-9)
+            await self._run_hooks(
+                "iteration_boundary",
+                conversation,
+                shared_memory=ctx.buffer,
+                iteration=iteration,
+                node_id=node_id,
             )
 
             # 6h. Worker auto-escalation on text-only turns
@@ -1824,6 +1835,7 @@ class EventLoopNode(NodeProtocol):
                 for key, value in accumulator.to_dict().items():
                     ctx.buffer.write(key, value, validate=False)
 
+                await self._fire_completion_hooks(conversation, ctx, node_id)
                 await self._publish_loop_completed(stream_id, node_id, iteration + 1, execution_id)
                 latency_ms = int((time.time() - start_time) * 1000)
                 _accept_count += 1
@@ -1867,6 +1879,7 @@ class EventLoopNode(NodeProtocol):
 
             elif verdict.action == "ESCALATE":
                 # Exit point 6: Judge ESCALATE — log step + log_node_complete
+                await self._fire_completion_hooks(conversation, ctx, node_id)
                 await self._publish_loop_completed(stream_id, node_id, iteration + 1, execution_id)
                 latency_ms = int((time.time() - start_time) * 1000)
                 _escalate_count += 1
@@ -1932,6 +1945,7 @@ class EventLoopNode(NodeProtocol):
                 continue
 
         # 7. Max iterations exhausted
+        await self._fire_completion_hooks(conversation, ctx, node_id)
         await self._publish_loop_completed(
             stream_id, node_id, self._config.max_iterations, execution_id
         )
@@ -3557,6 +3571,10 @@ class EventLoopNode(NodeProtocol):
         event: str,
         conversation: NodeConversation,
         trigger: str | None = None,
+        *,
+        shared_memory: Any = None,
+        iteration: int | None = None,
+        node_id: str | None = None,
     ) -> None:
         """Run all registered hooks for *event*, applying their results.
 
@@ -3571,6 +3589,28 @@ class EventLoopNode(NodeProtocol):
             event=event,
             conversation=conversation,
             trigger=trigger,
+            shared_memory=shared_memory,
+            iteration=iteration,
+            node_id=node_id,
+        )
+
+    async def _fire_completion_hooks(
+        self,
+        conversation: NodeConversation,
+        ctx: NodeContext,
+        node_id: str,
+    ) -> None:
+        """Fire node_complete hooks (DS-10).
+
+        Called at all semantic exit points: ACCEPT, ESCALATE, max-iterations,
+        empty-response fast-accept, and stall-detection failure.
+        Not called on mechanical aborts (pause, LLM crash, shutdown).
+        """
+        await self._run_hooks(
+            "node_complete",
+            conversation,
+            shared_memory=ctx.buffer,
+            node_id=node_id,
         )
 
     async def _publish_context_usage(

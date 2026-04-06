@@ -521,6 +521,18 @@ class WorkerAgent:
                 f" (fan-out: {[a.target_id for a in activations]})" if is_fan_out else "",
             )
 
+        # Fire phase transition hooks (DS-11) for each edge traversal
+        if activations and gc.lifecycle_hooks:
+            from framework.graph.executor import _run_phase_transition_hooks
+
+            for activation in activations:
+                await _run_phase_transition_hooks(
+                    gc.lifecycle_hooks,
+                    gc.buffer,
+                    self.node_spec.id,
+                    activation.target_id,
+                )
+
         return activations
 
     # ------------------------------------------------------------------

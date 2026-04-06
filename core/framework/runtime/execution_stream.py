@@ -196,6 +196,7 @@ class ExecutionStream:
         colony_worker_sessions_dir: Any = None,
         colony_recall_cache: dict[str, str] | None = None,
         colony_reflect_llm: Any = None,
+        lifecycle_hooks: dict[str, list] | None = None,
     ):
         """
         Initialize execution stream.
@@ -255,6 +256,7 @@ class ExecutionStream:
         self._colony_worker_sessions_dir = colony_worker_sessions_dir
         self._colony_recall_cache = colony_recall_cache
         self._colony_reflect_llm = colony_reflect_llm
+        self._lifecycle_hooks: dict[str, list] = lifecycle_hooks or {}
 
         _es_logger = logging.getLogger(__name__)
         if protocols_prompt:
@@ -739,6 +741,7 @@ class ExecutionStream:
                         colony_worker_sessions_dir=self._colony_worker_sessions_dir,
                         colony_recall_cache=self._colony_recall_cache,
                         colony_reflect_llm=self._colony_reflect_llm,
+                        lifecycle_hooks=self._lifecycle_hooks,
                     )
                     # Track executor so inject_input() can reach EventLoopNode instances
                     self._active_executors[execution_id] = executor

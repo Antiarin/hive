@@ -53,6 +53,7 @@ class GraphContext:
     skill_dirs: list[str] = field(default_factory=list)
     context_warn_ratio: float | None = None
     batch_init_nudge: str | None = None
+    lifecycle_hooks: dict[str, list] = field(default_factory=dict)
     dynamic_tools_provider: Any = None
     dynamic_prompt_provider: Any = None
     dynamic_memory_provider: Any = None

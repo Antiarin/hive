@@ -207,5 +207,18 @@ class SkillsManager:
         return self._default_mgr.context_warn_ratio  # type: ignore[union-attr]
 
     @property
+    def lifecycle_hooks(self) -> dict[str, list]:
+        """Precomputed lifecycle hook callbacks for default skills (DS-9/10/11).
+
+        Returns a dict suitable for merging into LoopConfig.hooks.
+        Empty dict if skills are not loaded or all defaults disabled.
+        """
+        if self._default_mgr is None:
+            return {}
+        hooks: dict[str, list] = {}
+        self._default_mgr.register_hooks(hooks)  # type: ignore[union-attr]
+        return hooks
+
+    @property
     def is_loaded(self) -> bool:
         return self._loaded

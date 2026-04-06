@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from framework.graph.conversation import NodeConversation
 from framework.graph.event_loop.types import HookContext
@@ -329,6 +330,10 @@ async def run_hooks(
     event: str,
     conversation: NodeConversation,
     trigger: str | None = None,
+    *,
+    shared_memory: Any = None,
+    iteration: int | None = None,
+    node_id: str | None = None,
 ) -> None:
     """Run all registered hooks for *event*, applying their results.
 
@@ -346,6 +351,9 @@ async def run_hooks(
             event=event,
             trigger=trigger,
             system_prompt=conversation.system_prompt,
+            shared_memory=shared_memory,
+            iteration=iteration,
+            node_id=node_id,
         )
         try:
             result = await hook(ctx)

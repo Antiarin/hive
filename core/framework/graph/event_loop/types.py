@@ -107,6 +107,10 @@ class HookContext:
     event: str
     trigger: str | None
     system_prompt: str
+    # Lifecycle hook extensions (DS-9, DS-10, DS-11)
+    shared_memory: Any = None  # SharedMemory instance when available
+    iteration: int | None = None  # Current iteration (iteration_boundary only)
+    node_id: str | None = None  # Node ID (iteration_boundary, node_complete)
 
 
 @dataclass

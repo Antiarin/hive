@@ -89,6 +89,7 @@ DATA_BUFFER_KEYS: list[str] = [
     "_batch_total",
     "_batch_completed",
     "_batch_failed",
+    "_batch_skipped",
     # context-preservation
     "_handoff_context",
     "_preserved_data",
@@ -276,3 +277,170 @@ class DefaultSkillManager:
             return None
         overrides = self._config.get_default_overrides("hive.context-preservation")
         return float(overrides.get("warn_at_usage_ratio", 0.45))
+
+    def register_hooks(self, hooks: dict[str, list]) -> None:
+        """Register lifecycle hook callbacks for all active default skills.
+
+        Each enabled skill appends its callbacks to the appropriate event
+        lists in *hooks*.  Callbacks read shared state from
+        ``ctx.shared_memory`` at invocation time — no SharedMemory reference
+        is captured here.
+
+        Args:
+            hooks: Mutable dict mapping event names to lists of async callables.
+                   The caller owns this dict; we only append.
+        """
+        from framework.graph.event_loop.types import HookContext, HookResult
+
+        if not self._skills:
+            return
+
+        def _append(event: str, fn: Any) -> None:
+            hooks.setdefault(event, []).append(fn)
+
+        # -- hive.quality-monitor (DS-9) --
+        if "hive.quality-monitor" in self._skills:
+            overrides = self._config.get_default_overrides("hive.quality-monitor")
+            assessment_interval = int(overrides.get("assessment_interval", 5))
+
+            async def _quality_iteration(ctx: HookContext) -> HookResult | None:
+                if ctx.iteration is None or (ctx.iteration + 1) % assessment_interval != 0:
+                    return None
+                return HookResult(
+                    inject=(
+                        f"[QUALITY CHECK — iteration {ctx.iteration + 1}] Self-assess: "
+                        "Are you on-task, thorough, non-repetitive, and consistent? "
+                        "Write assessment to `_quality_log`."
+                    ),
+                )
+
+            _append("iteration_boundary", _quality_iteration)
+
+        # -- hive.note-taking (DS-9, DS-10) --
+        if "hive.note-taking" in self._skills:
+            overrides = self._config.get_default_overrides("hive.note-taking")
+            staleness_threshold = int(overrides.get("staleness_threshold", 5))
+
+            async def _notes_iteration(ctx: HookContext) -> HookResult | None:
+                if ctx.iteration is None or ctx.shared_memory is None:
+                    return None
+                updated_at = ctx.shared_memory.read("_notes_updated_at")
+                if updated_at is None:
+                    return None
+                try:
+                    stale_iterations = ctx.iteration - int(updated_at)
+                except (TypeError, ValueError):
+                    return None
+                if stale_iterations < staleness_threshold:
+                    return None
+                return HookResult(
+                    inject=(
+                        f"[NOTES STALE — last updated {stale_iterations} iterations ago] "
+                        "Update `_working_notes` with current progress."
+                    ),
+                )
+
+            async def _notes_complete(ctx: HookContext) -> HookResult | None:
+                if ctx.shared_memory is None:
+                    return None
+                notes = ctx.shared_memory.read("_working_notes")
+                if notes:
+                    logger.info(
+                        "skill_hook event=node_complete skill=hive.note-taking "
+                        "node=%s notes_length=%d",
+                        ctx.node_id or "unknown",
+                        len(str(notes)),
+                    )
+                return None
+
+            _append("iteration_boundary", _notes_iteration)
+            _append("node_complete", _notes_complete)
+
+        # -- hive.batch-ledger (DS-9, DS-10) --
+        if "hive.batch-ledger" in self._skills:
+            overrides = self._config.get_default_overrides("hive.batch-ledger")
+            checkpoint_every_n = int(overrides.get("checkpoint_every_n", 10))
+
+            async def _batch_iteration(ctx: HookContext) -> HookResult | None:
+                if ctx.iteration is None or (ctx.iteration + 1) % checkpoint_every_n != 0:
+                    return None
+                if ctx.shared_memory is None:
+                    return None
+                total = ctx.shared_memory.read("_batch_total")
+                if total is None:
+                    return None
+                completed = ctx.shared_memory.read("_batch_completed") or 0
+                failed = ctx.shared_memory.read("_batch_failed") or 0
+                skipped = ctx.shared_memory.read("_batch_skipped") or 0
+                remaining = total - completed - failed - skipped
+                logger.info(
+                    "skill_hook event=iteration_boundary skill=hive.batch-ledger "
+                    "checkpoint total=%s completed=%s failed=%s skipped=%s remaining=%s",
+                    total,
+                    completed,
+                    failed,
+                    skipped,
+                    remaining,
+                )
+                return None
+
+            async def _batch_complete(ctx: HookContext) -> HookResult | None:
+                if ctx.shared_memory is None:
+                    return None
+                total = ctx.shared_memory.read("_batch_total")
+                if total is None:
+                    return None
+                completed = ctx.shared_memory.read("_batch_completed") or 0
+                failed = ctx.shared_memory.read("_batch_failed") or 0
+                skipped = ctx.shared_memory.read("_batch_skipped") or 0
+                processed = completed + failed + skipped
+                if processed < total:
+                    logger.warning(
+                        "skill_hook event=node_complete skill=hive.batch-ledger "
+                        "INCOMPLETE node=%s processed=%d/%d "
+                        "(completed=%d failed=%d skipped=%d)",
+                        ctx.node_id or "unknown",
+                        processed,
+                        total,
+                        completed,
+                        failed,
+                        skipped,
+                    )
+                return None
+
+            _append("iteration_boundary", _batch_iteration)
+            _append("node_complete", _batch_complete)
+
+        # -- hive.context-preservation (DS-10, DS-11) --
+        if "hive.context-preservation" in self._skills:
+            overrides = self._config.get_default_overrides("hive.context-preservation")
+            require_handoff = bool(overrides.get("require_handoff", True))
+
+            async def _context_complete(ctx: HookContext) -> HookResult | None:
+                if not require_handoff or ctx.shared_memory is None:
+                    return None
+                handoff = ctx.shared_memory.read("_handoff_context")
+                if not handoff:
+                    logger.warning(
+                        "skill_hook event=node_complete skill=hive.context-preservation "
+                        "MISSING_HANDOFF node=%s require_handoff=True",
+                        ctx.node_id or "unknown",
+                    )
+                return None
+
+            async def _context_transition(ctx: HookContext) -> HookResult | None:
+                if ctx.shared_memory is None:
+                    return None
+                handoff = ctx.shared_memory.read("_handoff_context")
+                if handoff:
+                    logger.info(
+                        "skill_hook event=phase_transition "
+                        "skill=hive.context-preservation "
+                        "handoff_available node=%s handoff_length=%d",
+                        ctx.node_id or "unknown",
+                        len(str(handoff)),
+                    )
+                return None
+
+            _append("node_complete", _context_complete)
+            _append("phase_transition", _context_transition)

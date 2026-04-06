@@ -206,6 +206,7 @@ class AgentRuntime:
         self.skill_dirs: list[str] = self._skills_manager.allowlisted_dirs
         self.context_warn_ratio: float | None = self._skills_manager.context_warn_ratio
         self.batch_init_nudge: str | None = self._skills_manager.batch_init_nudge
+        self.lifecycle_hooks: dict[str, list] = self._skills_manager.lifecycle_hooks
 
         # Primary graph identity
         self._graph_id: str = graph_id or "primary"
@@ -373,6 +374,7 @@ class AgentRuntime:
                     colony_worker_sessions_dir=self._colony_worker_sessions_dir,
                     colony_recall_cache=self._colony_recall_cache,
                     colony_reflect_llm=self._colony_reflect_llm,
+                    lifecycle_hooks=self.lifecycle_hooks,
                 )
                 await stream.start()
                 self._streams[ep_id] = stream

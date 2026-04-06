@@ -112,6 +112,42 @@ class ParallelExecutionConfig:
     branch_timeout_seconds: float = 300.0
 
 
+async def _run_phase_transition_hooks(
+    hooks: dict[str, list],
+    shared_memory: DataBuffer,
+    from_node: str,
+    to_node: str,
+) -> None:
+    """Fire phase_transition hooks after edge traversal (DS-11).
+
+    Unlike EventLoopNode's run_hooks(), this runs without a conversation
+    object — hooks can only read/write shared memory and log.  HookResult
+    inject/system_prompt fields are ignored.
+    """
+    from framework.graph.event_loop.types import HookContext
+
+    hook_list = hooks.get("phase_transition", [])
+    if not hook_list:
+        return
+    for hook in hook_list:
+        ctx = HookContext(
+            event="phase_transition",
+            trigger=None,
+            system_prompt="",
+            shared_memory=shared_memory,
+            node_id=from_node,
+        )
+        try:
+            await hook(ctx)
+        except Exception:
+            logger.warning(
+                "Phase transition hook raised an exception (from=%s to=%s)",
+                from_node,
+                to_node,
+                exc_info=True,
+            )
+
+
 class GraphExecutor:
     """
     Executes agent graphs.
@@ -164,6 +200,7 @@ class GraphExecutor:
         colony_worker_sessions_dir: Any = None,
         colony_recall_cache: dict[str, str] | None = None,
         colony_reflect_llm: Any = None,
+        lifecycle_hooks: dict[str, list] | None = None,
     ):
         """
         Initialize the executor.
@@ -196,6 +233,7 @@ class GraphExecutor:
             skill_dirs: Skill base directories for Tier 3 resource access
             context_warn_ratio: Token usage ratio to trigger DS-13 preservation warning
             batch_init_nudge: System prompt nudge for DS-12 batch auto-detection
+            lifecycle_hooks: Precomputed default skill lifecycle hooks (DS-9/10/11)
         """
         self.runtime = runtime
         self.llm = llm
@@ -236,6 +274,7 @@ class GraphExecutor:
         self.colony_worker_sessions_dir = colony_worker_sessions_dir
         self.colony_recall_cache = colony_recall_cache or {}
         self.colony_reflect_llm = colony_reflect_llm
+        self._lifecycle_hooks: dict[str, list] = lifecycle_hooks or {}
 
         if protocols_prompt:
             self.logger.info(
@@ -738,6 +777,20 @@ class GraphExecutor:
         "human_input": "event_loop",  # Use queen interaction / escalation instead
     }
 
+    def _merged_hooks(self, user_hooks: dict[str, list]) -> dict[str, list]:
+        """Merge user-provided hooks with default skill lifecycle hooks.
+
+        Per-event lists are concatenated — user hooks run first, then
+        lifecycle hooks.  Returns a new dict (neither input is mutated).
+        """
+        if not self._lifecycle_hooks:
+            return user_hooks
+        merged: dict[str, list] = {}
+        all_keys = set(user_hooks) | set(self._lifecycle_hooks)
+        for key in all_keys:
+            merged[key] = user_hooks.get(key, []) + self._lifecycle_hooks.get(key, [])
+        return merged
+
     def _get_node_implementation(
         self, node_spec: NodeSpec, cleanup_llm_model: str | None = None
     ) -> NodeProtocol:
@@ -813,7 +866,7 @@ class GraphExecutor:
                     max_context_tokens=lc.get("max_context_tokens", _default_max_context_tokens()),
                     max_tool_result_chars=lc.get("max_tool_result_chars", 30_000),
                     spillover_dir=spillover,
-                    hooks=lc.get("hooks", {}),
+                    hooks=self._merged_hooks(lc.get("hooks", {})),
                 ),
                 tool_executor=self.tool_executor,
                 conversation_store=conv_store,
@@ -1339,6 +1392,7 @@ class GraphExecutor:
             skill_dirs=self.skill_dirs,
             context_warn_ratio=self.context_warn_ratio,
             batch_init_nudge=self.batch_init_nudge,
+            lifecycle_hooks=self._merged_hooks(self._loop_config.get("hooks", {})),
             dynamic_tools_provider=self.dynamic_tools_provider,
             dynamic_prompt_provider=self.dynamic_prompt_provider,
             dynamic_memory_provider=self.dynamic_memory_provider,
