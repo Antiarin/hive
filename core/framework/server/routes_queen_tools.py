@@ -7,11 +7,12 @@ Lifecycle and synthetic tools (``ask_user``) are always part of the queen's
 surface in INDEPENDENT mode and are returned with ``editable: false``. MCP
 tools are grouped by origin server and carry per-tool ``enabled`` flags.
 
-The allowlist is a persisted queen-profile field, ``enabled_mcp_tools``:
+The allowlist is persisted in a dedicated ``tools.json`` sidecar at
+``~/.hive/agents/queens/{queen_id}/tools.json``:
 
-- ``null`` / missing  -> "allow every MCP tool" (default, backward-compat)
-- ``[]``              -> explicitly disable every MCP tool
-- ``["foo", "bar"]``  -> only these MCP tools pass through to the LLM
+- ``null`` / missing file -> "allow every MCP tool" (default)
+- ``[]``                  -> explicitly disable every MCP tool
+- ``["foo", "bar"]``      -> only these MCP tools pass through to the LLM
 
 Filtering happens in ``QueenPhaseState.rebuild_independent_filter`` so the
 LLM prompt cache stays warm between saves.
@@ -27,7 +28,10 @@ from aiohttp import web
 from framework.agents.queen.queen_profiles import (
     ensure_default_queens,
     load_queen_profile,
-    update_queen_profile,
+)
+from framework.agents.queen.queen_tools_config import (
+    load_queen_tools_config,
+    update_queen_tools_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -273,7 +277,7 @@ async def handle_get_tools(request: web.Request) -> web.Response:
     queen_id = request.match_info["queen_id"]
     ensure_default_queens()
     try:
-        profile = load_queen_profile(queen_id)
+        load_queen_profile(queen_id)
     except FileNotFoundError:
         return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
 
@@ -303,7 +307,9 @@ async def handle_get_tools(request: web.Request) -> web.Response:
     else:
         lifecycle = _lifecycle_entries_without_session(manager, mcp_tool_names_all)
 
-    enabled_mcp_tools = profile.get("enabled_mcp_tools")
+    # Allowlist lives in the dedicated tools.json sidecar; helper
+    # migrates legacy profile.yaml field on first read.
+    enabled_mcp_tools = load_queen_tools_config(queen_id)
 
     response = {
         "queen_id": queen_id,
@@ -376,8 +382,11 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
                 status=400,
             )
 
-    # Persist — we pass the raw value (``None`` → stored as YAML null).
-    updated = update_queen_profile(queen_id, {"enabled_mcp_tools": enabled})
+    # Persist — tools.json sidecar, not profile.yaml.
+    try:
+        update_queen_tools_config(queen_id, enabled)
+    except FileNotFoundError:
+        return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
 
     # Hot-reload every live DM session for this queen. The filter memo is
     # rebuilt so the very next turn sees the new allowlist without a
@@ -412,7 +421,7 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "queen_id": queen_id,
-            "enabled_mcp_tools": updated.get("enabled_mcp_tools"),
+            "enabled_mcp_tools": enabled,
             "refreshed_sessions": refreshed,
         }
     )

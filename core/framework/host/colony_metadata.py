@@ -1,18 +1,12 @@
 """Read/write helpers for per-colony metadata.json.
 
 A colony's metadata.json lives at ``{COLONIES_DIR}/{colony_name}/metadata.json``
-and holds both immutable provenance (the queen that created it, the forked
-session id, timestamps) and a small number of mutable user-editable fields.
+and holds immutable provenance: the queen that created it, the forked
+session id, creation/update timestamps, and the list of workers.
 
-Today the only mutable field we surface through the UI is:
-
-- ``enabled_mcp_tools: list[str] | null`` — the per-colony MCP tool
-  allowlist. ``None`` means "allow every MCP tool" (default), so
-  existing colonies without the key keep their current behavior.
-
-Keeping the read/write helpers in one place — instead of scattering
-``json.loads(metadata_path.read_text())`` across the server — makes the
-schema easy to evolve without chasing readers.
+Mutable user-editable tool configuration lives in a sibling
+``tools.json`` sidecar — see :mod:`framework.host.colony_tools_config`
+— so identity and tool gating evolve independently.
 """
 
 from __future__ import annotations

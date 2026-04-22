@@ -15,11 +15,12 @@ Semantics:
   synthetic pass through).
 - ``enabled_mcp_tools: [...]`` →  only listed names pass.
 
-The allowlist is persisted in ``~/.hive/colonies/{colony_name}/metadata.json``
-and takes effect on the *next* worker spawn. In-flight workers keep the
-tool list they booted with because workers have no dynamic tools
-provider today — mutating their tool set mid-turn would diverge from
-the list the LLM is already using.
+The allowlist is persisted in a dedicated ``tools.json`` sidecar at
+``~/.hive/colonies/{colony_name}/tools.json``. Changes take effect on
+the *next* worker spawn. In-flight workers keep the tool list they
+booted with because workers have no dynamic tools provider today —
+mutating their tool set mid-turn would diverge from the list the LLM
+is already using.
 """
 
 from __future__ import annotations
@@ -29,10 +30,10 @@ from typing import Any
 
 from aiohttp import web
 
-from framework.host.colony_metadata import (
-    colony_metadata_path,
-    load_colony_metadata,
-    update_colony_metadata,
+from framework.host.colony_metadata import colony_metadata_path
+from framework.host.colony_tools_config import (
+    load_colony_tools_config,
+    update_colony_tools_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -201,10 +202,9 @@ async def handle_get_tools(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Colony '{colony_name}' not found"}, status=404)
 
     manager = request.app.get("manager")
-    meta = load_colony_metadata(colony_name)
-    enabled = meta.get("enabled_mcp_tools")
-    if enabled is not None and not isinstance(enabled, list):
-        enabled = None
+    # Allowlist now lives in a dedicated tools.json sidecar; helper
+    # migrates any legacy metadata.json field on first read.
+    enabled = load_colony_tools_config(colony_name)
 
     catalog = await _render_catalog(manager, colony_name)
     stale = not catalog
@@ -259,9 +259,10 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
                 status=400,
             )
 
-    # Persist — missing metadata.json already guarded by 404 above.
+    # Persist — tools.json sidecar, not metadata.json. Missing directory
+    # is already guarded by the 404 check above.
     try:
-        update_colony_metadata(colony_name, {"enabled_mcp_tools": enabled})
+        update_colony_tools_config(colony_name, enabled)
     except FileNotFoundError:
         return web.json_response({"error": f"Colony '{colony_name}' not found"}, status=404)
 
@@ -302,14 +303,13 @@ async def handle_list_colonies(request: web.Request) -> web.Response:
 
     Powers the Tool Library page's colony picker.
     """
-    from framework.host.colony_metadata import list_colony_names
+    from framework.host.colony_metadata import list_colony_names, load_colony_metadata
 
     colonies: list[dict[str, Any]] = []
     for name in list_colony_names():
         meta = load_colony_metadata(name)
-        allowlist = meta.get("enabled_mcp_tools")
-        if allowlist is not None and not isinstance(allowlist, list):
-            allowlist = None
+        # Provenance stays in metadata.json; allowlist lives in tools.json.
+        allowlist = load_colony_tools_config(name)
         colonies.append(
             {
                 "name": name,

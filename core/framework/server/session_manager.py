@@ -1542,12 +1542,12 @@ class SessionManager:
             enabled_mcp_tools: list[str] | None = None
             colony_name = getattr(session, "colony_name", None)
             if colony_name:
-                from framework.host.colony_metadata import load_colony_metadata
+                # Colony tool allowlist lives in a dedicated tools.json
+                # sidecar next to metadata.json. The helper migrates any
+                # legacy field out of metadata.json on first read.
+                from framework.host.colony_tools_config import load_colony_tools_config
 
-                colony_meta = load_colony_metadata(colony_name)
-                raw = colony_meta.get("enabled_mcp_tools")
-                if raw is None or isinstance(raw, list):
-                    enabled_mcp_tools = raw
+                enabled_mcp_tools = load_colony_tools_config(colony_name)
             colony.set_tool_allowlist(enabled_mcp_tools, mcp_tool_names_all)
         except Exception:
             logger.debug(

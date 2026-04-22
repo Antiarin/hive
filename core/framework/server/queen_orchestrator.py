@@ -552,7 +552,13 @@ async def create_queen(
         getattr(queen_registry, "_mcp_server_tools", {})
     )
     phase_state.mcp_tool_names_all = set().union(*mcp_server_tools_map.values()) if mcp_server_tools_map else set()
-    phase_state.enabled_mcp_tools = queen_profile.get("enabled_mcp_tools")
+    # The queen's MCP tool allowlist now lives in a dedicated
+    # ``tools.json`` sidecar next to ``profile.yaml``. ``load_queen_tools_config``
+    # migrates any legacy ``enabled_mcp_tools`` field out of profile.yaml
+    # on first read, so existing installs upgrade silently.
+    from framework.agents.queen.queen_tools_config import load_queen_tools_config
+
+    phase_state.enabled_mcp_tools = load_queen_tools_config(queen_dir.name)
     phase_state.rebuild_independent_filter()
     if phase_state.enabled_mcp_tools is not None:
         total_mcp = len(phase_state.mcp_tool_names_all)

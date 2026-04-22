@@ -102,6 +102,7 @@ def colony_dir(tmp_path, monkeypatch):
     colonies = tmp_path / "colonies"
     colonies.mkdir()
     monkeypatch.setattr("framework.host.colony_metadata.COLONIES_DIR", colonies)
+    monkeypatch.setattr("framework.host.colony_tools_config.COLONIES_DIR", colonies)
 
     name = "my_colony"
     cdir = colonies / name
@@ -159,6 +160,9 @@ async def test_patch_persists_and_validates(colony_dir):
         }
     )
     app = await _app(manager)
+    tools_path = colonies_dir / name / "tools.json"
+    metadata_path = colonies_dir / name / "metadata.json"
+
     async with TestClient(TestServer(app)) as client:
         resp = await client.patch(
             f"/api/colony/{name}/tools", json={"enabled_mcp_tools": ["read_file"]}
@@ -167,9 +171,12 @@ async def test_patch_persists_and_validates(colony_dir):
         body = await resp.json()
         assert body["enabled_mcp_tools"] == ["read_file"]
 
-        # Persisted to metadata.json
-        raw = json.loads((colonies_dir / name / "metadata.json").read_text())
-        assert raw["enabled_mcp_tools"] == ["read_file"]
+        # Persisted to tools.json; metadata.json does not carry the field.
+        sidecar = json.loads(tools_path.read_text())
+        assert sidecar["enabled_mcp_tools"] == ["read_file"]
+        assert "updated_at" in sidecar
+        meta = json.loads(metadata_path.read_text())
+        assert "enabled_mcp_tools" not in meta
 
         # GET reflects the allowlist
         resp = await client.get(f"/api/colony/{name}/tools")
@@ -242,3 +249,31 @@ async def test_tools_index_lists_colonies(colony_dir):
     assert name in entries
     assert entries[name]["queen_name"] == "queen_technology"
     assert entries[name]["has_allowlist"] is False
+
+
+def test_legacy_metadata_field_migrates_to_sidecar(colony_dir):
+    """A legacy enabled_mcp_tools field in metadata.json is hoisted to tools.json."""
+    colonies_dir, name = colony_dir
+    meta_path = colonies_dir / name / "metadata.json"
+    tools_path = colonies_dir / name / "tools.json"
+
+    # Seed legacy field in metadata.json.
+    meta = json.loads(meta_path.read_text())
+    meta["enabled_mcp_tools"] = ["read_file"]
+    meta_path.write_text(json.dumps(meta))
+
+    from framework.host.colony_tools_config import load_colony_tools_config
+
+    # First load migrates.
+    assert load_colony_tools_config(name) == ["read_file"]
+    assert tools_path.exists()
+    sidecar = json.loads(tools_path.read_text())
+    assert sidecar["enabled_mcp_tools"] == ["read_file"]
+
+    # metadata.json no longer contains the field; provenance fields preserved.
+    migrated = json.loads(meta_path.read_text())
+    assert "enabled_mcp_tools" not in migrated
+    assert migrated["queen_name"] == "queen_technology"
+
+    # Second load is a direct sidecar read.
+    assert load_colony_tools_config(name) == ["read_file"]

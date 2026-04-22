@@ -12,6 +12,7 @@ spawn an MCP subprocess.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -125,10 +126,11 @@ class _FakeManager:
 
 @pytest.fixture
 def queen_dir(tmp_path, monkeypatch):
-    """Redirect queen profile storage into a tmp dir."""
+    """Redirect queen profile + tools storage into a tmp dir."""
     queens_dir = tmp_path / "queens"
     queens_dir.mkdir()
     monkeypatch.setattr("framework.agents.queen.queen_profiles.QUEENS_DIR", queens_dir)
+    monkeypatch.setattr("framework.agents.queen.queen_tools_config.QUEENS_DIR", queens_dir)
 
     queen_id = "queen_technology"
     (queens_dir / queen_id).mkdir()
@@ -189,6 +191,9 @@ async def test_patch_persists_and_validates(queen_dir, monkeypatch):
     }
 
     app = await _make_app(manager=manager)
+    tools_path = queens_dir / queen_id / "tools.json"
+    profile_path = queens_dir / queen_id / "profile.yaml"
+
     async with TestClient(TestServer(app)) as client:
         # Happy path
         resp = await client.patch(
@@ -199,9 +204,12 @@ async def test_patch_persists_and_validates(queen_dir, monkeypatch):
         body = await resp.json()
         assert body["enabled_mcp_tools"] == ["read_file"]
 
-        # Profile persisted
-        raw = yaml.safe_load((queens_dir / queen_id / "profile.yaml").read_text())
-        assert raw["enabled_mcp_tools"] == ["read_file"]
+        # Sidecar persisted; profile YAML untouched by tools PATCH
+        sidecar = json.loads(tools_path.read_text())
+        assert sidecar["enabled_mcp_tools"] == ["read_file"]
+        assert "updated_at" in sidecar
+        profile = yaml.safe_load(profile_path.read_text())
+        assert "enabled_mcp_tools" not in profile
 
         # GET reflects the new state
         resp = await client.get(f"/api/queen/{queen_id}/tools")
@@ -217,8 +225,10 @@ async def test_patch_persists_and_validates(queen_dir, monkeypatch):
         assert resp.status == 200
         body = await resp.json()
         assert body["enabled_mcp_tools"] is None
+        sidecar = json.loads(tools_path.read_text())
+        assert sidecar["enabled_mcp_tools"] is None
 
-        # Unknown tool name → 400; profile unchanged
+        # Unknown tool name → 400; sidecar unchanged
         resp = await client.patch(
             f"/api/queen/{queen_id}/tools",
             json={"enabled_mcp_tools": ["nope_not_a_tool"]},
@@ -226,9 +236,8 @@ async def test_patch_persists_and_validates(queen_dir, monkeypatch):
         assert resp.status == 400
         detail = await resp.json()
         assert "nope_not_a_tool" in detail.get("unknown", [])
-        raw = yaml.safe_load((queens_dir / queen_id / "profile.yaml").read_text())
-        # Still cleared from the previous successful null-reset
-        assert raw["enabled_mcp_tools"] is None
+        sidecar = json.loads(tools_path.read_text())
+        assert sidecar["enabled_mcp_tools"] is None
 
 
 @pytest.mark.asyncio
@@ -295,3 +304,31 @@ async def test_missing_queen_returns_404(queen_dir, monkeypatch):
             json={"enabled_mcp_tools": None},
         )
         assert resp.status == 404
+
+
+def test_legacy_profile_field_migrates_to_sidecar(queen_dir):
+    """A legacy enabled_mcp_tools field in profile.yaml is hoisted to tools.json."""
+    queens_dir, queen_id = queen_dir
+    profile_path = queens_dir / queen_id / "profile.yaml"
+    tools_path = queens_dir / queen_id / "tools.json"
+
+    # Seed legacy field in profile.yaml.
+    profile = yaml.safe_load(profile_path.read_text()) or {}
+    profile["enabled_mcp_tools"] = ["read_file", "write_file"]
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False))
+
+    from framework.agents.queen.queen_tools_config import load_queen_tools_config
+
+    # First load migrates.
+    assert load_queen_tools_config(queen_id) == ["read_file", "write_file"]
+    assert tools_path.exists()
+    sidecar = json.loads(tools_path.read_text())
+    assert sidecar["enabled_mcp_tools"] == ["read_file", "write_file"]
+
+    # profile.yaml no longer contains the field; other fields preserved.
+    migrated_profile = yaml.safe_load(profile_path.read_text())
+    assert "enabled_mcp_tools" not in migrated_profile
+    assert migrated_profile["name"] == "Alexandra"
+
+    # Second load is a direct read — no migration work to do.
+    assert load_queen_tools_config(queen_id) == ["read_file", "write_file"]
