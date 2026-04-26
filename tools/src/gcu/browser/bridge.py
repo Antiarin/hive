@@ -2207,11 +2207,20 @@ class BeelineBridge:
             pass
         _interaction_highlights.pop(tab_id, None)
 
-    async def scroll(self, tab_id: int, direction: str = "down", amount: int = 500) -> dict:
-        """Scroll the page.
+    async def scroll(
+        self,
+        tab_id: int,
+        direction: str = "down",
+        amount: int = 500,
+        selector: str | None = None,
+    ) -> dict:
+        """Scroll the page or a specific scrollable container.
 
-        Uses JavaScript to find and scroll the appropriate container.
-        Handles SPAs like LinkedIn where content is in a nested scrollable div.
+        If ``selector`` is given, scroll that element directly (supports
+        '>>>' shadow-piercing selectors). Otherwise pick a container with
+        a direction-aware heuristic that prefers the visible scroll area
+        at the viewport center, falling back to the largest visible
+        scrollable element, then to ``window.scrollBy``.
         """
         delta_x = 0
         delta_y = 0
@@ -2224,47 +2233,101 @@ class BeelineBridge:
         elif direction == "left":
             delta_x = -amount
 
-        # JavaScript scroll that finds the largest scrollable container
-        # NOTE: Do NOT wrap in IIFE - evaluate() already wraps scripts
+        # Direction axis: only consider candidates that can actually scroll
+        # along the requested axis. 'y' for up/down, 'x' for left/right.
+        axis = "y" if direction in ("up", "down") else "x"
+
+        selector_json = json.dumps(selector) if selector else "null"
+
+        # NOTE: Do NOT wrap in IIFE — evaluate() already wraps scripts.
+        # Use behavior:'instant' so the post-scroll snapshot reflects the
+        # final state without racing the smooth-scroll animation.
         scroll_script = f"""
-            // Find the largest scrollable container
-            const candidates = [];
-            const allElements = document.querySelectorAll('*');
+            {self._SHADOW_QUERY_JS}
 
-            for (const el of allElements) {{
-                const style = getComputedStyle(el);
-                const overflow = style.overflow + style.overflowY;
+            const dx = {delta_x};
+            const dy = {delta_y};
+            const axis = {json.dumps(axis)};
+            const userSelector = {selector_json};
 
-                if (overflow.includes('scroll') || overflow.includes('auto')) {{
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 100 && rect.height > 100 &&
-                        el.scrollHeight > el.clientHeight + 100) {{
-                        candidates.push({{el: el, area: rect.width * rect.height}});
-                    }}
+            function canScroll(el) {{
+                if (!el || el.nodeType !== 1) return false;
+                if (el === document.scrollingElement || el === document.documentElement || el === document.body) {{
+                    return axis === 'y'
+                        ? document.documentElement.scrollHeight > window.innerHeight + 1
+                        : document.documentElement.scrollWidth > window.innerWidth + 1;
                 }}
+                const style = getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') return false;
+                const overflow = axis === 'y'
+                    ? (style.overflowY + style.overflow)
+                    : (style.overflowX + style.overflow);
+                if (!/auto|scroll|overlay/.test(overflow)) return false;
+                return axis === 'y'
+                    ? el.scrollHeight > el.clientHeight + 1
+                    : el.scrollWidth > el.clientWidth + 1;
             }}
 
+            function findScrollableAncestor(el) {{
+                let node = el;
+                while (node && node !== document.body && node !== document.documentElement) {{
+                    if (canScroll(node)) return node;
+                    node = node.parentElement;
+                }}
+                return null;
+            }}
+
+            // 1. Explicit selector wins
+            if (userSelector) {{
+                const el = userSelector.includes('>>>')
+                    ? _shadowQuery(userSelector)
+                    : document.querySelector(userSelector);
+                if (!el) {{
+                    return {{ success: false, error: 'selector_not_found', selector: userSelector }};
+                }}
+                if (!canScroll(el)) {{
+                    return {{ success: false, error: 'not_scrollable_in_direction',
+                             selector: userSelector, axis: axis, tag: el.tagName }};
+                }}
+                el.scrollBy({{ top: dy, left: dx, behavior: 'instant' }});
+                return {{ success: true, method: 'selector', tag: el.tagName }};
+            }}
+
+            // 2. Prefer the scrollable ancestor at the viewport center —
+            //    a much better proxy for "what the agent is looking at"
+            //    than "largest element on the page."
+            const cx = window.innerWidth / 2;
+            const cy = window.innerHeight / 2;
+            const elAtCenter = document.elementFromPoint(cx, cy);
+            const centerHit = findScrollableAncestor(elAtCenter);
+            if (centerHit) {{
+                centerHit.scrollBy({{ top: dy, left: dx, behavior: 'instant' }});
+                return {{ success: true, method: 'viewport-center', tag: centerHit.tagName }};
+            }}
+
+            // 3. Fallback: largest visible scrollable element on the
+            //    correct axis. Filters out hidden/offscreen drawers and
+            //    elements that scroll the wrong way.
+            const candidates = [];
+            for (const el of document.querySelectorAll('*')) {{
+                if (!canScroll(el)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 || rect.height < 50) continue;
+                // Must intersect the viewport
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+                if (rect.right <= 0 || rect.left >= window.innerWidth) continue;
+                candidates.push({{ el: el, area: rect.width * rect.height }});
+            }}
             candidates.sort((a, b) => b.area - a.area);
-            const container = candidates.length > 0 ? candidates[0].el : null;
-
-            if (container) {{
-                container.scrollBy({{ top: {delta_y}, left: {delta_x}, behavior: 'smooth' }});
-                return {{
-                    success: true,
-                    method: 'container',
-                    tag: container.tagName,
-                    scrolled: true
-                }};
+            if (candidates.length > 0) {{
+                const container = candidates[0].el;
+                container.scrollBy({{ top: dy, left: dx, behavior: 'instant' }});
+                return {{ success: true, method: 'largest-visible', tag: container.tagName }};
             }}
 
-            // Fallback to window scroll
-            window.scrollBy({{ top: {delta_y}, left: {delta_x}, behavior: 'smooth' }});
-            return {{
-                success: true,
-                method: 'window',
-                tag: 'WINDOW',
-                scrolled: true
-            }};
+            // 4. Last resort: window scroll
+            window.scrollBy({{ top: dy, left: dx, behavior: 'instant' }});
+            return {{ success: true, method: 'window', tag: 'WINDOW' }};
         """
 
         try:
@@ -2280,8 +2343,18 @@ class BeelineBridge:
                     "method": value.get("method", "js"),
                     "container": value.get("tag", "unknown"),
                 }
-            else:
-                return {"ok": False, "error": "scroll script returned failure"}
+            err = value.get("error") or "scroll script returned failure"
+            if err == "selector_not_found":
+                return {"ok": False, "error": f"Element not found: {value.get('selector')}"}
+            if err == "not_scrollable_in_direction":
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Element {value.get('tag')} ({value.get('selector')}) is not "
+                        f"scrollable along the {value.get('axis')} axis"
+                    ),
+                }
+            return {"ok": False, "error": err}
 
         except TimeoutError:
             return {"ok": False, "error": "scroll timed out"}

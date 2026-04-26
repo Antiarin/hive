@@ -110,10 +110,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "browser_scroll": {
-        "description": "Scroll the page.",
+        "description": "Scroll the page or a specific scrollable container.",
         "params": {
             "direction": {"type": "string", "default": "down", "enum": ["up", "down", "left", "right"]},
             "amount": {"type": "integer", "default": 500},
+            "selector": {"type": "string"},
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
         },

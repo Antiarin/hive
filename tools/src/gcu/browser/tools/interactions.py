@@ -845,16 +845,24 @@ def register_interaction_tools(mcp: FastMCP) -> None:
     async def browser_scroll(
         direction: Literal["up", "down", "left", "right"] = "down",
         amount: int = 500,
+        selector: str | None = None,
         tab_id: int | None = None,
         profile: str | None = None,
         auto_snapshot_mode: AutoSnapshotMode = "default",
     ) -> dict:
         """
-        Scroll the page.
+        Scroll the page or a specific scrollable container.
 
         Args:
             direction: Scroll direction (up, down, left, right)
             amount: Scroll amount in pixels (default: 500)
+            selector: Optional CSS selector for the container to scroll.
+                Supports '>>>' shadow-piercing selectors. When omitted,
+                the tool picks the scrollable container at the viewport
+                center, then falls back to the largest visible
+                scrollable element, then to the window. Use this when
+                auto-pick scrolls the wrong area (e.g. nested panels,
+                modals over a long page, chat history beside a sidebar).
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
             auto_snapshot_mode: Controls the accessibility snapshot taken
@@ -869,7 +877,13 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             ``auto_snapshot_mode="off"`` or the scroll failed.
         """
         start = time.perf_counter()
-        params = {"direction": direction, "amount": amount, "tab_id": tab_id, "profile": profile}
+        params = {
+            "direction": direction,
+            "amount": amount,
+            "selector": selector,
+            "tab_id": tab_id,
+            "profile": profile,
+        }
 
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -890,7 +904,9 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             return result
 
         try:
-            scroll_result = await bridge.scroll(target_tab, direction=direction, amount=amount)
+            scroll_result = await bridge.scroll(
+                target_tab, direction=direction, amount=amount, selector=selector
+            )
             log_tool_call(
                 "browser_scroll",
                 params,
