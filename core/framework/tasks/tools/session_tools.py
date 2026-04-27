@@ -266,6 +266,40 @@ def _make_update_executor(store: TaskStore):
         ):
             owner_in = agent_id
 
+        # task_completed hook — fires BEFORE the write (Claude Code's
+        # veto-before-write semantics). If the hook blocks, nothing
+        # touches disk and no SSE event fires. The hook receives a
+        # preview record with the intended new status so it can inspect
+        # what's about to land.
+        if status_enum == TaskStatus.COMPLETED:
+            current = await store.get_task(list_id, task_id)
+            if current is None:
+                return {
+                    "success": False,
+                    "task_list_id": list_id,
+                    "task_id": task_id,
+                    "message": f"Task #{task_id} not found.",
+                }
+            if current.status != TaskStatus.COMPLETED:
+                preview = current.model_copy(update={"status": TaskStatus.COMPLETED})
+                try:
+                    await run_task_hooks(
+                        HOOK_TASK_COMPLETED,
+                        task_list_id=list_id,
+                        task=preview,
+                        agent_id=agent_id,
+                    )
+                except BlockingHookError as exc:
+                    logger.warning("task_completed hook blocked #%s: %s", task_id, exc)
+                    return {
+                        "success": False,
+                        "task_list_id": list_id,
+                        "task_id": task_id,
+                        "message": f"Hook blocked completion of #{task_id}: {exc}",
+                        "task": _serialize_task(current),
+                    }
+
+        # Hook passed (or wasn't applicable) — proceed with the write.
         new, fields = await store.update_task(
             list_id,
             task_id,
@@ -286,27 +320,6 @@ def _make_update_executor(store: TaskStore):
                 "task_id": task_id,
                 "message": f"Task #{task_id} not found.",
             }
-
-        # task_completed hooks fire on transition to completed; can block.
-        if status_enum == TaskStatus.COMPLETED and "status" in fields:
-            try:
-                await run_task_hooks(
-                    HOOK_TASK_COMPLETED,
-                    task_list_id=list_id,
-                    task=new,
-                    agent_id=agent_id,
-                )
-            except BlockingHookError as exc:
-                # Roll back the status transition and surface the error.
-                logger.warning("task_completed hook blocked #%s: %s", new.id, exc)
-                rb_new, _ = await store.update_task(list_id, task_id, status=TaskStatus.IN_PROGRESS)
-                return {
-                    "success": False,
-                    "task_list_id": list_id,
-                    "task_id": task_id,
-                    "message": f"Hook blocked completion of #{task_id}: {exc}",
-                    "task": _serialize_task(rb_new) if rb_new else None,
-                }
 
         if fields:
             await emit_task_updated(task_list_id=list_id, record=new, fields=fields)

@@ -273,6 +273,48 @@ async def test_hook_blocks_task_completed(
         ToolRegistry.reset_execution_context(token)
 
 
+@pytest.mark.asyncio
+async def test_hook_blocks_task_completed_never_writes(
+    registry_with_session_tools: ToolRegistry,
+    store: TaskStore,
+) -> None:
+    """Veto-before-write: when the task_completed hook blocks, the COMPLETED
+    status must NEVER touch disk — `updated_at` should equal the value from
+    the prior in_progress write, not be bumped by a transient COMPLETED
+    write + rollback."""
+    from framework.tasks.models import TaskStatus
+
+    reg = registry_with_session_tools
+    list_id = "session:agent_a:sess_1"
+    register_hook(HOOK_TASK_COMPLETED, lambda ctx: (_ for _ in ()).throw(BlockingHookError("nope")))
+    token = _set_ctx(agent_id="agent_a", task_list_id=list_id)
+    try:
+        await _invoke(reg, "task_create", subject="x")
+        await _invoke(reg, "task_update", id=1, status="in_progress")
+        # Snapshot updated_at after the in_progress write — this is the
+        # value that should persist if veto-before-write is honored.
+        before = await store.get_task(list_id, 1)
+        assert before is not None
+        ts_before = before.updated_at
+
+        # Vetoed completion attempt.
+        result = await _invoke(reg, "task_update", id=1, status="completed")
+        body = json.loads(result.content)
+        assert body["success"] is False
+
+        # On-disk record must be byte-identical to the pre-vet snapshot —
+        # no transient COMPLETED write, no rollback updated_at bump.
+        after = await store.get_task(list_id, 1)
+        assert after is not None
+        assert after.status == TaskStatus.IN_PROGRESS
+        assert after.updated_at == ts_before, (
+            "veto-before-write violated: updated_at changed, indicating a "
+            "transient write happened"
+        )
+    finally:
+        ToolRegistry.reset_execution_context(token)
+
+
 # ---------------------------------------------------------------------------
 # Colony template tools
 # ---------------------------------------------------------------------------
