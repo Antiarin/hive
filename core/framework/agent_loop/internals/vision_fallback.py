@@ -196,16 +196,53 @@ async def caption_tool_image(
         {"role": "user", "content": user_blocks},
     ]
 
+    # Apply the same proxy rewrites the main LLM provider uses so a
+    # `hive/...` / `kimi/...` model resolves to the right Anthropic-
+    # compatible endpoint with the right auth header. Without this,
+    # litellm doesn't know what `hive/kimi-k2.5` is and rejects the call
+    # with "LLM Provider NOT provided."
+    from framework.llm.litellm import rewrite_proxy_model
+
+    rewritten_model, rewritten_base, extra_headers = rewrite_proxy_model(
+        model, api_key, api_base
+    )
+
     kwargs: dict[str, Any] = {
-        "model": model,
+        "model": rewritten_model,
         "messages": messages,
         "max_tokens": 1024,
         "timeout": timeout_s,
     }
-    if api_key:
+    # Pass api_key directly only when there are no proxy-rewritten
+    # extra_headers carrying the auth (e.g. the gemini-3-flash override
+    # path goes direct to Gemini, not through the Hive proxy).
+    if api_key and not extra_headers:
         kwargs["api_key"] = api_key
-    if api_base:
-        kwargs["api_base"] = api_base
+    if rewritten_base:
+        kwargs["api_base"] = rewritten_base
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
+
+    # Surface where the request is going so the user can verify the
+    # vision fallback is hitting the expected proxy / model. Redacts
+    # the API key to a length+head+tail digest so it can be cross-
+    # correlated with other auth-related log lines.
+    key_digest = (
+        f"len={len(api_key)} {api_key[:8]}…{api_key[-4:]}"
+        if api_key and len(api_key) >= 12
+        else f"len={len(api_key) if api_key else 0}"
+    )
+    logger.info(
+        "[vision_fallback] dispatching: configured_model=%s rewritten_model=%s "
+        "api_base=%s api_key=%s images=%d intent_chars=%d timeout_s=%.1f",
+        model,
+        rewritten_model,
+        rewritten_base or "<litellm-default>",
+        key_digest,
+        len(image_content),
+        len(intent),
+        timeout_s,
+    )
 
     started = datetime.now()
     caption: str | None = None
@@ -215,9 +252,21 @@ async def caption_tool_image(
         text = (response.choices[0].message.content or "").strip()
         if text:
             caption = text
+        logger.info(
+            "[vision_fallback] response: model=%s api_base=%s elapsed_s=%.2f chars=%d",
+            rewritten_model,
+            rewritten_base or "<litellm-default>",
+            (datetime.now() - started).total_seconds(),
+            len(text),
+        )
     except Exception as exc:
         error_text = f"{type(exc).__name__}: {exc}"
-        logger.debug("vision_fallback model '%s' failed: %s", model, exc)
+        logger.warning(
+            "[vision_fallback] failed: model=%s api_base=%s error=%s",
+            rewritten_model,
+            rewritten_base or "<litellm-default>",
+            error_text,
+        )
 
     # Best-effort audit log so users can grep ~/.hive/llm_logs/ for
     # vision-fallback subagent calls. Failures here must not bubble.

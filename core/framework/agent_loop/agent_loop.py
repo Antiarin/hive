@@ -181,23 +181,6 @@ def _strip_internal_tags_from_snapshot(snapshot: str) -> str:
     return cleaned
 
 
-async def _describe_images_as_text(image_content: list[dict[str, Any]]) -> tuple[str, str] | None:
-    """Describe images for the injection-queue drain (no preceding tool call).
-
-    Wraps :func:`_captioning_chain` with a generic intent and returns
-    the caption inside an ``[image attached — description: …]`` envelope
-    so the injected text reads as image content rather than free-form
-    prose.
-    """
-    intent = "Describe the attached image(s) so a text-only agent can understand them."
-    result = await _captioning_chain(intent, image_content)
-    if not result:
-        return None
-    description, model = result
-    label = "image" if len(image_content) == 1 else f"{len(image_content)} images"
-    return f"[{label} attached  — description: {description}]", model
-
-
 def _vision_fallback_active(model: str | None) -> bool:
     """Return True if tool-result images for *model* should be routed
     through the vision-fallback chain rather than sent to the model.
@@ -3435,7 +3418,7 @@ class AgentLoop(AgentProtocol):
             # single image needs captioning, this collapses to a
             # single await with no overhead.
             _model_text_only = ctx.llm and _vision_fallback_active(ctx.llm.model)
-            caption_tasks: dict[str, asyncio.Task[str | None]] = {}
+            caption_tasks: dict[str, asyncio.Task[tuple[str, str] | None]] = {}
             if _model_text_only:
                 for tc in tool_calls[:executed_in_batch]:
                     res = results_by_id.get(tc.tool_use_id)
@@ -4139,7 +4122,7 @@ class AgentLoop(AgentProtocol):
             queue=self._injection_queue,
             conversation=conversation,
             ctx=ctx,
-            describe_images_as_text_fn=_describe_images_as_text,
+            caption_image_fn=_captioning_chain,
         )
 
     async def _drain_trigger_queue(self, conversation: NodeConversation) -> int:

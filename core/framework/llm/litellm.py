@@ -211,6 +211,44 @@ def _ensure_ollama_chat_prefix(model: str) -> str:
     return model
 
 
+def rewrite_proxy_model(
+    model: str, api_key: str | None, api_base: str | None
+) -> tuple[str, str | None, dict[str, str]]:
+    """Apply Hive/Kimi proxy rewrites for any caller of ``litellm.acompletion``.
+
+    Both the Hive LLM proxy and Kimi For Coding expose Anthropic-API-
+    compatible endpoints. LiteLLM doesn't recognise the ``hive/`` or
+    ``kimi/`` prefixes natively, so we rewrite them to ``anthropic/``
+    here. For the Hive proxy we also stamp a Bearer token into
+    ``extra_headers`` because litellm's Anthropic handler only sends
+    ``x-api-key`` and the proxy expects ``Authorization: Bearer``.
+
+    Used by ad-hoc ``litellm.acompletion`` callers (e.g. the vision-
+    fallback subagent in ``caption_tool_image``) so they hit the same
+    proxy with the same auth as the main agent's ``LiteLLMProvider``.
+    The provider's own ``__init__`` keeps its inlined rewrite for now —
+    this helper is the single source of truth for ad-hoc callers.
+
+    Returns: (rewritten_model, normalised_api_base, extra_headers).
+    The ``extra_headers`` dict is non-empty only for the Hive proxy
+    (and only when ``api_key`` is provided).
+    """
+    extra_headers: dict[str, str] = {}
+    if model.lower().startswith("kimi/"):
+        model = "anthropic/" + model[len("kimi/") :]
+        if api_base and api_base.rstrip("/").endswith("/v1"):
+            api_base = api_base.rstrip("/")[:-3]
+    elif model.lower().startswith("hive/"):
+        model = "anthropic/" + model[len("hive/") :]
+        if api_base and api_base.rstrip("/").endswith("/v1"):
+            api_base = api_base.rstrip("/")[:-3]
+        # Hive proxy expects Bearer auth; litellm's Anthropic handler
+        # only sends x-api-key without this nudge.
+        if api_key:
+            extra_headers["Authorization"] = f"Bearer {api_key}"
+    return model, api_base, extra_headers
+
+
 RATE_LIMIT_MAX_RETRIES = 10
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
@@ -963,6 +1001,7 @@ class LiteLLMProvider(LLMProvider):
         # Translate kimi/ prefix to anthropic/ so litellm uses the Anthropic
         # Messages API handler and routes to that endpoint — no special headers needed.
         _original_model = model
+        self._hive_proxy_auth = bool(_original_model.lower().startswith("hive/"))
         if _is_ollama_model(model):
             model = _ensure_ollama_chat_prefix(model)
         elif model.lower().startswith("kimi/"):
@@ -1016,6 +1055,7 @@ class LiteLLMProvider(LLMProvider):
         these attributes in-place propagates to all callers on the next LLM call.
         """
         _original_model = model
+        self._hive_proxy_auth = bool(_original_model.lower().startswith("hive/"))
         if _is_ollama_model(model):
             model = _ensure_ollama_chat_prefix(model)
         elif model.lower().startswith("kimi/"):
@@ -1255,6 +1295,16 @@ class LiteLLMProvider(LLMProvider):
                 # Ollama requires explicit tool_choice=auto for function calling
                 # so future readers don't have to guess.
                 kwargs.setdefault("tool_choice", "auto")
+            elif self._hive_proxy_auth:
+                # The Hive LLM proxy fronts GLM, which drifts into "explain
+                # the plan" mode on long-context turns instead of emitting
+                # tool_use blocks (verified 2026-04-28: tool_choice=null →
+                # text-only stop=stop; tool_choice=required → clean
+                # tool_use). Force a tool call when tools are available
+                # so queens can't get stuck in chat mode. Callers that
+                # legitimately want a non-tool turn can override via
+                # extra_kwargs.
+                kwargs.setdefault("tool_choice", "required")
 
         # Add response_format for structured output
         # LiteLLM passes this through to the underlying provider
@@ -1492,6 +1542,10 @@ class LiteLLMProvider(LLMProvider):
                 # Ollama requires explicit tool_choice=auto for function calling
                 # so future readers don't have to guess.
                 kwargs.setdefault("tool_choice", "auto")
+            elif self._hive_proxy_auth:
+                # See `complete()` for the rationale: GLM behind the Hive
+                # proxy needs forcing or it goes chat-mode on long contexts.
+                kwargs.setdefault("tool_choice", "required")
         if response_format:
             kwargs["response_format"] = response_format
 
@@ -2276,6 +2330,10 @@ class LiteLLMProvider(LLMProvider):
                 # Ollama requires explicit tool_choice=auto for function calling
                 # so future readers don't have to guess.
                 kwargs.setdefault("tool_choice", "auto")
+            elif self._hive_proxy_auth:
+                # See `complete()` for the rationale: GLM behind the Hive
+                # proxy needs forcing or it goes chat-mode on long contexts.
+                kwargs.setdefault("tool_choice", "required")
         if response_format:
             kwargs["response_format"] = response_format
         # The Codex ChatGPT backend (Responses API) rejects several params.

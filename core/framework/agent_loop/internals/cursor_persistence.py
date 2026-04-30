@@ -162,9 +162,20 @@ async def drain_injection_queue(
     conversation: NodeConversation,
     *,
     ctx: NodeContext,
-    describe_images_as_text_fn: (Callable[[list[dict[str, Any]]], Awaitable[tuple[str, str] | None]] | None) = None,
+    caption_image_fn: (
+        Callable[[str, list[dict[str, Any]]], Awaitable[tuple[str, str] | None]] | None
+    ) = None,
 ) -> int:
-    """Drain all pending injected events as user messages. Returns count."""
+    """Drain all pending injected events as user messages. Returns count.
+
+    ``caption_image_fn`` is the unified vision fallback hook. It takes
+    ``(intent, image_content)`` and returns ``(caption, model)`` on
+    success — the model id is logged so the destination is observable.
+    The user's typed ``content`` (the injected message body) is passed
+    as the intent so the captioner can answer the user's specific
+    question about the image rather than producing a generic
+    description; an empty content falls back to a generic intent.
+    """
     count = 0
     logger.debug(
         "[drain_injection_queue] Starting to drain queue, initial queue size: %s",
@@ -184,10 +195,13 @@ async def drain_injection_queue(
                     "Model '%s' does not support images; attempting vision fallback",
                     ctx.llm.model,
                 )
-                if describe_images_as_text_fn is not None:
-                    described = await describe_images_as_text_fn(image_content)
-                    if described:
-                        description, vision_model = described
+                if caption_image_fn is not None:
+                    intent = content or (
+                        "Describe these user-injected images for a text-only agent."
+                    )
+                    caption_result = await caption_image_fn(intent, image_content)
+                    if caption_result:
+                        description, vision_model = caption_result
                         content = f"{content}\n\n{description}" if content else description
                         logger.info(
                             "[drain] image described as text via vision fallback (model '%s')",
